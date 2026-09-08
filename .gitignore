@@ -164,3 +164,8 @@ cython_debug/
 # Boltz prediction outputs
 #   All result files generated from a boltz prediction call
 boltz_results_*/
+
+
+# Boltz prediction outputs from notebook UI
+outputs/
+outputs.zip
