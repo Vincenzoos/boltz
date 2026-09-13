@@ -127,6 +127,23 @@ def _list_output_zip_options(outputs_dir: Path) -> List[Tuple[str, str]]:
     return options
 
 
+def _list_result_folder_options(outputs_dir: Path) -> List[Tuple[str, str]]:
+    """Return (label, value) pairs for job folders under outputs/ that may hold predictions."""
+    options: List[Tuple[str, str]] = []
+    if outputs_dir.is_dir():
+        for p in sorted(outputs_dir.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_dir() and not p.name.startswith("."):
+                options.append((p.name, p.name))
+    if not options:
+        options = [("(no output folders)", "")]
+    return options
+
+
+def _job_out_dir(outputs_dir: Path, job_folder: str) -> Path:
+    """Boltz writes under outputs/<job>/out (predictions nested inside)."""
+    return outputs_dir / job_folder / "out"
+
+
 def _zip_outputs(
     outputs_dir: Path,
     selection: str,
@@ -401,7 +418,7 @@ def _parse_process_memory_output(output: str) -> List[Tuple[int, str]]:
 
 def _is_boltz_cmdline(command_line: str) -> bool:
     """True if the process looks like a Boltz predict / main entrypoint."""
-    cl = command_line.lower()
+    cl = (command_line or "").lower()
     if "boltz.main" in cl:
         return True
     if "boltz" in cl and "predict" in cl:
@@ -409,95 +426,48 @@ def _is_boltz_cmdline(command_line: str) -> bool:
     return False
 
 
-def _boltz_gpu_processes_text() -> str:
-    """Table of active Boltz processes currently using GPU memory."""
+def _is_boltz_main_process(process_name: str, command_line: str) -> bool:
+    """Match the main Boltz job process; skip DataLoader workers / shells."""
+    name = (process_name or "").lower()
+    if name in {"pt_data_worker", "tee", "bash", "sh", "zsh", "tmux", "sleep"}:
+        return False
+    if name == "boltz":
+        return True
+    if name.startswith("python") and _is_boltz_cmdline(command_line):
+        return True
+    return False
+
+
+def _ps_user_comm_args(pid: int) -> Optional[Tuple[str, str, str]]:
+    """Return (user, comm, args) for pid, or None if unavailable."""
     try:
-        gpu_proc = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index",
-                "--format=csv,noheader,nounits",
-            ],
+        ps_proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "user=,comm=,args="],
             capture_output=True,
             text=True,
             check=False,
         )
-    except FileNotFoundError:
-        return "nvidia-smi is unavailable; active Boltz GPU jobs cannot be listed."
-    except Exception as exc:
-        return f"Unable to query visible GPUs: {exc}"
+    except Exception:
+        return None
+    if ps_proc.returncode != 0 or not (ps_proc.stdout or "").strip():
+        return None
+    fields = ps_proc.stdout.strip().split(None, 2)
+    if len(fields) < 3:
+        return None
+    return fields[0], fields[1], fields[2]
 
-    if gpu_proc.returncode != 0:
-        detail = (gpu_proc.stderr or gpu_proc.stdout or "").strip()
-        message = (
-            "nvidia-smi could not list visible GPUs; "
-            "active Boltz GPU jobs cannot be listed."
-        )
-        return f"{message}\n{detail}" if detail else message
 
-    gpu_indices: List[str] = []
-    for line in (gpu_proc.stdout or "").splitlines():
-        try:
-            gpu_indices.append(str(int(line.strip())))
-        except (TypeError, ValueError):
-            continue
+def _proc_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        return "?"
 
-    rows: List[Tuple[str, str, str, str, str, str]] = []
-    for gpu_index in gpu_indices:
-        try:
-            apps_proc = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "-i",
-                    gpu_index,
-                    "--query-compute-apps=pid,used_gpu_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
-            return "nvidia-smi is unavailable; active Boltz GPU jobs cannot be listed."
-        except Exception as exc:
-            return f"Unable to query GPU {gpu_index}: {exc}"
-        if apps_proc.returncode != 0:
-            detail = (apps_proc.stderr or apps_proc.stdout or "").strip()
-            message = f"Unable to query compute applications on GPU {gpu_index}."
-            return f"{message}\n{detail}" if detail else message
 
-        for pid, memory in _parse_process_memory_output(apps_proc.stdout):
-            try:
-                ps_proc = subprocess.run(
-                    ["ps", "-p", str(pid), "-o", "user=,comm=,args="],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            except FileNotFoundError:
-                return "ps is unavailable; process details cannot be resolved."
-            except Exception as exc:
-                return f"Unable to read process {pid}: {exc}"
-            if ps_proc.returncode != 0 or not (ps_proc.stdout or "").strip():
-                continue
-
-            ps_fields = ps_proc.stdout.strip().split(None, 2)
-            if len(ps_fields) < 3:
-                continue
-            user, process_name, command_line = ps_fields
-            if not _is_boltz_cmdline(command_line):
-                continue
-            try:
-                working_directory = os.readlink(f"/proc/{pid}/cwd")
-            except Exception:
-                working_directory = "?"
-            mem_label = memory if "mib" in memory.lower() else f"{memory} MiB"
-            rows.append(
-                (gpu_index, str(pid), user, process_name, working_directory, mem_label)
-            )
-
+def _format_boltz_jobs_table(rows: List[Tuple[str, str, str, str, str, str]]) -> str:
+    """Format (gpu, pid, user, process, cwd, memory) rows as a fixed-width table."""
     if not rows:
-        return "No active Boltz jobs are currently using GPU memory."
+        return "No active Boltz predict jobs found."
 
     column_widths = (8, 12, 16, 24, 48)
     header = (
@@ -523,6 +493,110 @@ def _boltz_gpu_processes_text() -> str:
         formatted_rows.append("".join(cells).rstrip())
 
     return "\n".join([header, separator, *formatted_rows])
+
+
+def _boltz_gpu_processes_text() -> str:
+    """Table of active Boltz processes (GPU memory users + running predict jobs)."""
+    # pid -> (gpu_index or "-", memory label)
+    gpu_mem: Dict[int, Tuple[str, str]] = {}
+    try:
+        gpu_proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "nvidia-smi is unavailable; active Boltz GPU jobs cannot be listed."
+    except Exception as exc:
+        return f"Unable to query visible GPUs: {exc}"
+
+    if gpu_proc.returncode == 0:
+        gpu_indices: List[str] = []
+        for line in (gpu_proc.stdout or "").splitlines():
+            try:
+                gpu_indices.append(str(int(line.strip())))
+            except (TypeError, ValueError):
+                continue
+        for gpu_index in gpu_indices:
+            try:
+                apps_proc = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "-i",
+                        gpu_index,
+                        "--query-compute-apps=pid,used_gpu_memory",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                continue
+            if apps_proc.returncode != 0:
+                continue
+            for pid, memory in _parse_process_memory_output(apps_proc.stdout):
+                mem_label = memory if "mib" in memory.lower() else f"{memory} MiB"
+                gpu_mem[pid] = (gpu_index, mem_label)
+
+    # Collect main Boltz predict PIDs from GPU users and process scan (covers
+    # MSA / startup phases that have not allocated VRAM yet).
+    candidate_pids: Dict[int, Tuple[str, str]] = {}
+    for pid in list(gpu_mem):
+        info = _ps_user_comm_args(pid)
+        if info is None:
+            continue
+        user, process_name, command_line = info
+        if _is_boltz_main_process(process_name, command_line):
+            candidate_pids[pid] = (user, process_name)
+
+    try:
+        scan = subprocess.run(
+            ["ps", "-eo", "pid=,user=,comm=,args="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if scan.returncode == 0:
+            for line in (scan.stdout or "").splitlines():
+                fields = line.strip().split(None, 3)
+                if len(fields) < 4:
+                    continue
+                try:
+                    pid = int(fields[0])
+                except ValueError:
+                    continue
+                user, process_name, command_line = fields[1], fields[2], fields[3]
+                if not _is_boltz_main_process(process_name, command_line):
+                    continue
+                candidate_pids.setdefault(pid, (user, process_name))
+    except Exception:
+        pass
+
+    rows: List[Tuple[str, str, str, str, str, str]] = []
+    for pid in sorted(candidate_pids):
+        user, process_name = candidate_pids[pid]
+        if pid in gpu_mem:
+            gpu_index, mem_label = gpu_mem[pid]
+        else:
+            gpu_index, mem_label = "-", "(not using GPU yet)"
+        rows.append(
+            (
+                gpu_index,
+                str(pid),
+                user,
+                process_name,
+                _proc_cwd(pid),
+                mem_label,
+            )
+        )
+
+    return _format_boltz_jobs_table(rows)
 
 
 def _find_boltz() -> str:
@@ -710,6 +784,66 @@ def _parse_log_exit(log_path: Path) -> Optional[int]:
         if match:
             return int(match.group(1))
     return None
+
+
+# tqdm-style: optional label, then "N%|...| cur/total"
+_TQDM_PROGRESS_RE = re.compile(
+    r"(?:(?P<label>SUBMIT|COMPLETE|Predicting(?:\s+DataLoader\s+\d+)?)\s*:\s*)?"
+    r"(?P<pct>\d+)\s*%\s*\|[^|\r\n]*\|\s*(?P<cur>\d+)/(?P<total>\d+)",
+    re.MULTILINE,
+)
+
+
+def _read_log_snippet(log_path: Path, max_bytes: int = 65536) -> str:
+    """Read the end of a run log (enough for the latest tqdm state)."""
+    if not log_path.is_file():
+        return ""
+    size = log_path.stat().st_size
+    with log_path.open("rb") as handle:
+        if size > max_bytes:
+            handle.seek(size - max_bytes)
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def _parse_job_progress(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract overall job progress from a boltz run.log.
+
+    Prefers structure prediction (Predicting / DataLoader) bars; falls back to
+    the MSA batch bar (unlabeled cur/total, skipping ColabFold 300-step waits).
+    Does not alter log display — parsing only.
+    """
+    if not text:
+        return None
+    normalized = text.replace("\r", "\n")
+    best_msa: Optional[Dict[str, Any]] = None
+    best_pred: Optional[Dict[str, Any]] = None
+    for match in _TQDM_PROGRESS_RE.finditer(normalized):
+        label = (match.group("label") or "").strip()
+        current = int(match.group("cur"))
+        total = int(match.group("total"))
+        if total <= 0:
+            continue
+        if label.startswith("Predicting"):
+            best_pred = {
+                "stage": "Predicting",
+                "label": label,
+                "current": current,
+                "total": total,
+                "pct": int(match.group("pct")),
+            }
+        elif label in ("SUBMIT", "COMPLETE"):
+            continue
+        elif total != 300:
+            # Overall MSA generation bar (e.g. 2/11), not ColabFold's 0/300 waits.
+            best_msa = {
+                "stage": "MSA",
+                "label": "MSA",
+                "current": current,
+                "total": total,
+                "pct": int(match.group("pct")),
+            }
+    return best_pred or best_msa
 
 
 def _predictions_dir(out_dir: Path) -> Optional[Path]:
@@ -1099,7 +1233,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     gpu = widgets.Dropdown(
         options=gpu_opts,
         value=default_gpu if any(v == default_gpu for _, v in gpu_opts) else gpu_opts[0][1],
-        description="GPU:",
+        description="Device:",
         style={"description_width": "120px"},
         layout=widgets.Layout(width="85%"),
     )
@@ -1125,15 +1259,14 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         "<b>Processes</b> section shows programs currently using GPU memory.</p>"
     )
     boltz_gpu_processes_heading = widgets.HTML(
-        "<b>Active Boltz jobs using GPU memory</b>"
+        "<b>Active Boltz jobs</b>"
     )
     boltz_gpu_processes_help = widgets.HTML(
-        "<p><b>Active Boltz jobs:</b> This table shows only Boltz processes currently "
-        "using GPU memory. <b>GPU</b> is the GPU number, <b>PID</b> identifies the running "
-        "process, <b>User</b> is the account running it, <b>Process</b> is the program name, "
-        "<b>CWD</b> shows the project folder it is running from, and <b>GPU Memory</b> "
-        "shows how much memory that job is using. If the table is empty, no Boltz job is "
-        "currently using a GPU.</p>"
+        "<p><b>Active Boltz jobs:</b> This table lists running <code>boltz predict</code> "
+        "processes. <b>GPU</b> is the GPU number (or <code>-</code> if not using VRAM yet), "
+        "<b>PID</b> identifies the process, <b>User</b> is the account, <b>Process</b> is the "
+        "program name, <b>CWD</b> is the working directory, and <b>GPU Memory</b> shows VRAM use. "
+        "Open this tab or press <b>Refresh monitor</b> to update.</p>"
     )
     gpu_refreshing = {"active": False}
 
@@ -1164,8 +1297,16 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         refresh_gpu_dropdown()
         refresh_monitoring_panels()
 
+    refresh_monitor_btn = widgets.Button(
+        description="Refresh monitor",
+        icon="refresh",
+        button_style="info",
+        layout=widgets.Layout(width="180px"),
+    )
+
     gpu.observe(on_gpu_selection_change, names="value")
     refresh_gpu_btn.on_click(on_refresh_gpu)
+    refresh_monitor_btn.on_click(refresh_monitoring_panels)
 
     diffusion_samples = widgets.IntSlider(
         value=5, min=1, max=25, step=1, description="Samples:", style={"description_width": "120px"}
@@ -1199,13 +1340,18 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         layout=widgets.Layout(width="95%", height="280px", border="1px solid #d0d7de", overflow="auto")
     )
     results_view = widgets.HTML(value=_results_html([]))
-    preview = widgets.HTML(value="")
+    results_status = widgets.HTML(value=f'<span style="{MUTED}">Select an output folder to inspect.</span>')
 
-    btn_preview = widgets.Button(description="Preview inputs", icon="eye")
-    btn_write = widgets.Button(description="Write inputs", button_style="primary", icon="save")
-    btn_cmd = widgets.Button(description="Show command", icon="terminal")
     btn_run = widgets.Button(description="Run predict", button_style="success", icon="play")
-    btn_results = widgets.Button(description="Refresh results", icon="table")
+    btn_refresh_results = widgets.Button(description="Refresh results", icon="table")
+    btn_refresh_result_folders = widgets.Button(description="Refresh folders", icon="refresh")
+    results_folder_dd = widgets.Dropdown(
+        options=[("(no output folders)", "")],
+        value="",
+        description="Output folder:",
+        layout=widgets.Layout(width="70%"),
+        style={"description_width": "110px"},
+    )
     abort_job_dd = widgets.Dropdown(
         options=[("(none)", "")],
         description="Running:",
@@ -1215,6 +1361,23 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     )
     btn_refresh_jobs = widgets.Button(description="Refresh jobs", icon="refresh")
     btn_abort = widgets.Button(description="Abort", button_style="danger", icon="stop", disabled=True)
+    job_progress = widgets.FloatProgress(
+        value=0.0,
+        min=0.0,
+        max=1.0,
+        description="",
+        bar_style="info",
+        layout=widgets.Layout(width="70%", height="22px"),
+    )
+    job_progress_label = widgets.HTML(
+        value=f'<span style="{MUTED}">No running job selected.</span>'
+    )
+    job_progress_box = widgets.VBox(
+        [
+            widgets.HTML(f"<b>Job progress</b> <span style='{MUTED}'>(selected running job)</span>"),
+            widgets.HBox([job_progress, job_progress_label]),
+        ]
+    )
 
     # Panels per mode
     yaml_panel = widgets.VBox(
@@ -1301,7 +1464,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         [
             widgets.HTML(
                 f"<span style='{MUTED}'>Point at an existing <code>.yaml</code> / <code>.fasta</code> "
-                "file or a directory of inputs. Nothing is rewritten unless you use Write.</span>"
+                "file or a directory of inputs. Inputs are used as-is (not rewritten).</span>"
             ),
             existing_path,
         ]
@@ -1851,52 +2014,6 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             addon_summary.value = f'<span style="{ERR}">{html_msg}</span>'
             _set_status("Validation failed — config not saved.", False)
 
-    def on_preview(_=None) -> None:
-        try:
-            mode = input_mode.value
-            if mode == "path":
-                p = Path(existing_path.value.strip()).expanduser()
-                if not p.exists():
-                    raise ValueError(f"Path does not exist: {p}")
-                if p.is_dir():
-                    files = sorted(list(p.glob("*.yaml")) + list(p.glob("*.fasta")))
-                    preview.value = (
-                        f"<pre style='font-size:12px;'>path mode → directory {p}\n"
-                        + "\n".join(f.name for f in files)
-                        + "</pre>"
-                    )
-                else:
-                    preview.value = f"<pre style='font-size:12px;max-height:240px;overflow:auto;'>{p.read_text()[:4000]}</pre>"
-                _set_status(f"Previewing {p}", True)
-                return
-            _, docs = _documents_from_ui()
-            chunks = [f"# {stem}.yaml\n{_dump_yaml(doc)}" for stem, doc in docs]
-            text = "\n---\n".join(chunks)
-            if len(text) > 6000:
-                text = text[:6000] + "\n... [truncated]"
-            preview.value = f"<pre style='font-size:12px;max-height:240px;overflow:auto;'>{text}</pre>"
-            _set_status(f"Preview: {len(docs)} input file(s).", True)
-        except Exception as exc:
-            preview.value = ""
-            _set_status(str(exc), False)
-
-    def on_write(_=None) -> None:
-        try:
-            if input_mode.value == "path":
-                p = _resolve_input_for_run(write=False)
-                _set_status(f"Path mode — using existing input: {p}", True)
-                return
-            inp = _resolve_input_for_run(write=True)
-            n = len(list(inp.glob('*.yaml'))) if inp.is_dir() else 1
-            _set_status(f"Wrote {n} input file(s) → {inp}", True)
-            with log:
-                print(f"[write] {inp}")
-                if inp.is_dir():
-                    for p in sorted(inp.glob("*.yaml")):
-                        print(f"  - {p.name}")
-        except Exception as exc:
-            _set_status(str(exc), False)
-
     def current_cmd() -> Tuple[List[str], Dict[str, str], Path, Path]:
         inp = _resolve_input_for_run(write=input_mode.value != "path")
         _, out_dir = _paths()
@@ -1928,21 +2045,59 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         )
         return cmd, env, inp, out_dir
 
-    def on_cmd(_=None) -> None:
-        try:
-            cmd, env, inp, out_dir = current_cmd()
-            with log:
-                print("[command]")
-                print("input =", inp)
-                print("out   =", out_dir)
-                print("CUDA_VISIBLE_DEVICES=" + env.get("CUDA_VISIBLE_DEVICES", "<default>"))
-                print(subprocess.list2cmdline(cmd))
-            _set_status("Command printed in log.", True)
-        except Exception as exc:
-            _set_status(str(exc), False)
-
     def _job_key() -> str:
         return str(_paths()[1])
+
+    def _outputs_root_resolved() -> Path:
+        raw = Path(outputs_root_w.value.strip() or str(default_outputs)).expanduser()
+        return raw.resolve() if raw.is_absolute() else (BOLTZ_ROOT / raw).resolve()
+
+    def _log_path_for_session(session: str) -> Optional[Path]:
+        if not session:
+            return None
+        with JOBS_LOCK:
+            for info in RUNNING_JOBS.values():
+                if info.get("session") == session and info.get("log_path"):
+                    return Path(str(info["log_path"]))
+        candidate = _outputs_root_resolved() / _session_job_name(session) / "run.log"
+        return candidate if candidate.is_file() else None
+
+    def _reset_job_progress(msg: str = "No running job selected.") -> None:
+        job_progress.value = 0.0
+        job_progress.bar_style = ""
+        job_progress_label.value = f'<span style="{MUTED}">{msg}</span>'
+
+    def _update_selected_job_progress(_=None) -> None:
+        session = abort_job_dd.value
+        if not session:
+            _reset_job_progress()
+            return
+        log_path = _log_path_for_session(session)
+        if log_path is None:
+            _reset_job_progress("Waiting for log…")
+            return
+        progress = _parse_job_progress(_read_log_snippet(log_path))
+        if not progress:
+            job_progress.value = 0.0
+            job_progress.bar_style = "info"
+            job_progress_label.value = (
+                f'<span style="{MUTED}">Starting… '
+                f"({_session_job_name(session)})</span>"
+            )
+            return
+        total = max(1, int(progress["total"]))
+        current = max(0, min(int(progress["current"]), total))
+        frac = current / total
+        job_progress.value = frac
+        job_progress.bar_style = "success" if current >= total else "info"
+        stage = progress.get("stage") or progress.get("label") or "Progress"
+        pct = progress.get("pct")
+        if pct is None:
+            pct = int(round(frac * 100))
+        job_progress_label.value = (
+            f"<span style='font-weight:600;'>{stage}</span> "
+            f"{current}/{total} ({pct}%)"
+        )
 
     def _refresh_abort_jobs(_=None) -> None:
         jobs = _list_running_boltz_jobs()
@@ -1955,6 +2110,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             abort_job_dd.value = ""
             abort_job_dd.disabled = True
             btn_abort.disabled = True
+        _update_selected_job_progress()
 
     def _log_job(session: str, msg: str, *, end: str = "\n") -> None:
         with log:
@@ -2039,6 +2195,8 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             offset, chunk = _read_log_tail(log_path, offset)
             if chunk:
                 _log_job(session, chunk, end="")
+            if abort_job_dd.value == session:
+                _update_selected_job_progress()
             time.sleep(0.5)
 
         offset, chunk = _read_log_tail(log_path, offset)
@@ -2057,8 +2215,16 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             _log_job(session, f"[done] exit={rc}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
             if _job_key() == key:
                 rows = _collect_results(out_dir)
-                results_view.value = _results_html(rows)
                 _set_status(f"{session}: finished OK. {len(rows)} result row(s).", True)
+                # Refresh Results tab if it is already pointing at this job folder.
+                finished_job = out_dir.parent.name
+                if results_folder_dd.value == finished_job:
+                    results_view.value = _results_html(rows)
+                    pred_dir = _predictions_dir(out_dir)
+                    results_status.value = (
+                        f'<span style="{OK}">Loaded {len(rows)} result row(s) from '
+                        f"{pred_dir or out_dir / 'predictions'}</span>"
+                    )
             else:
                 _set_status(f"{session}: finished OK.", True)
         else:
@@ -2083,16 +2249,6 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             _set_status(f"Abort failed: {exc}", False)
         _refresh_abort_jobs()
 
-    def on_results(_=None) -> None:
-        _, out_dir = _paths()
-        rows = _collect_results(out_dir)
-        results_view.value = _results_html(rows)
-        pred_dir = _predictions_dir(out_dir)
-        _set_status(
-            f"Loaded {len(rows)} result row(s) from {pred_dir or out_dir / 'predictions'}",
-            True,
-        )
-
     # wire events
     ent_type.observe(_on_ent_type, names="value")
     input_mode.observe(_on_mode, names="value")
@@ -2107,13 +2263,10 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     btn_binder_next.on_click(on_binder_next)
     remodel_target_seq.observe(_autocap_seq_widget, names="value")
     btn_save_addon.on_click(on_save_addon)
-    btn_preview.on_click(on_preview)
-    btn_write.on_click(on_write)
-    btn_cmd.on_click(on_cmd)
     btn_run.on_click(on_run)
     btn_refresh_jobs.on_click(_refresh_abort_jobs)
+    abort_job_dd.observe(_update_selected_job_progress, names="value")
     btn_abort.on_click(on_abort)
-    btn_results.on_click(on_results)
 
     _on_ent_type()
     _on_mode()
@@ -2136,7 +2289,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             # cache_dir,
         ]
     )
-    input_tab = widgets.VBox([_banner("Input"), input_mode, input_body, preview])
+    input_tab = widgets.VBox([_banner("Input"), input_mode, input_body])
     opts_tab = widgets.VBox(
         [
             _banner("Prediction options"),
@@ -2144,12 +2297,6 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             gpu,
             widgets.HBox([refresh_gpu_btn]),
             gpu_status,
-            nvidia_smi_heading,
-            nvidia_smi_help,
-            nvidia_smi_panel,
-            boltz_gpu_processes_heading,
-            boltz_gpu_processes_help,
-            boltz_gpu_processes_panel,
             diffusion_samples,
             recycling_steps,
             sampling_steps,
@@ -2164,7 +2311,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     run_tab = widgets.VBox(
         [
             _banner("Run"),
-            widgets.HBox([btn_preview, btn_write, btn_cmd, btn_run, btn_results]),
+            widgets.HBox([btn_run]),
             status,
             widgets.HTML("<b>Log</b>"),
             log,
@@ -2173,8 +2320,19 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 "(parallel runs need different job names — select one to abort)</span>"
             ),
             widgets.HBox([abort_job_dd, btn_refresh_jobs, btn_abort]),
-            widgets.HTML("<b>Results</b> <span style='color:#57606a;'>(sorted by iptm)</span>"),
-            results_view,
+            job_progress_box,
+        ]
+    )
+    monitor_tab = widgets.VBox(
+        [
+            _banner("GPU monitor"),
+            widgets.HBox([refresh_monitor_btn]),
+            nvidia_smi_heading,
+            nvidia_smi_help,
+            nvidia_smi_panel,
+            boltz_gpu_processes_heading,
+            boltz_gpu_processes_help,
+            boltz_gpu_processes_panel,
         ]
     )
 
@@ -2182,6 +2340,58 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     def _outputs_dir() -> Path:
         raw = Path(outputs_root_w.value.strip() or str(default_outputs)).expanduser()
         return raw.resolve() if raw.is_absolute() else (BOLTZ_ROOT / raw).resolve()
+
+    def _refresh_results_folders(_=None, *, prefer: Optional[str] = None) -> None:
+        prev = prefer if prefer is not None else results_folder_dd.value
+        opts = _list_result_folder_options(_outputs_dir())
+        results_folder_dd.options = opts
+        values = [v for _, v in opts]
+        if prev in values and prev:
+            results_folder_dd.value = prev
+        elif job_name.value in values:
+            results_folder_dd.value = job_name.value
+        else:
+            results_folder_dd.value = values[0] if values else ""
+
+    def _load_results_for_selected(_=None) -> None:
+        folder = results_folder_dd.value
+        if not folder:
+            results_view.value = _results_html([])
+            results_status.value = f'<span style="{MUTED}">Select an output folder to inspect.</span>'
+            return
+        out_dir = _job_out_dir(_outputs_dir(), folder)
+        rows = _collect_results(out_dir)
+        results_view.value = _results_html(rows)
+        pred_dir = _predictions_dir(out_dir)
+        results_status.value = (
+            f'<span style="{OK}">Loaded {len(rows)} result row(s) from '
+            f"{pred_dir or out_dir / 'predictions'}</span>"
+        )
+
+    def on_results_folder_change(change=None) -> None:
+        if change is not None and change.get("name") != "value":
+            return
+        _load_results_for_selected()
+
+    btn_refresh_result_folders.on_click(_refresh_results_folders)
+    btn_refresh_results.on_click(_load_results_for_selected)
+    results_folder_dd.observe(on_results_folder_change, names="value")
+    _refresh_results_folders(prefer=_sanitize_name(job_name.value) or "")
+    _load_results_for_selected()
+
+    results_tab = widgets.VBox(
+        [
+            _banner("Results"),
+            widgets.HTML(
+                f"<p style='margin:0 0 8px 0;'>Pick a job folder under <code>outputs/</code> "
+                f"to inspect prediction metrics (sorted by iptm).</p>"
+            ),
+            widgets.HBox([results_folder_dd, btn_refresh_result_folders, btn_refresh_results]),
+            results_status,
+            widgets.HTML("<b>Results</b> <span style='color:#57606a;'>(sorted by iptm)</span>"),
+            results_view,
+        ]
+    )
 
     zip_dropdown = widgets.Dropdown(
         options=_list_output_zip_options(_outputs_dir()),
@@ -2263,14 +2473,42 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         ]
     )
 
-    tabs = widgets.Tab(children=[setup_tab, input_tab, opts_tab, run_tab, download_tab])
+    tabs = widgets.Tab(
+        children=[
+            setup_tab,
+            input_tab,
+            opts_tab,
+            run_tab,
+            monitor_tab,
+            results_tab,
+            download_tab,
+        ]
+    )
     tabs.set_title(0, "Setup")
     tabs.set_title(1, "Input")
     tabs.set_title(2, "Options")
     tabs.set_title(3, "Run")
-    tabs.set_title(4, "Download")
+    tabs.set_title(4, "Monitor")
+    tabs.set_title(5, "Results")
+    tabs.set_title(6, "Download")
+
+    MONITOR_TAB_INDEX = 4
+    RESULTS_TAB_INDEX = 5
+
+    def on_tab_change(change) -> None:
+        if change.get("name") != "selected_index":
+            return
+        idx = change.get("new")
+        if idx == MONITOR_TAB_INDEX:
+            refresh_monitoring_panels()
+        elif idx == RESULTS_TAB_INDEX:
+            _refresh_results_folders()
+            _load_results_for_selected()
+
+    tabs.observe(on_tab_change, names="selected_index")
     display(tabs)
     _refresh_abort_jobs()
+    refresh_monitoring_panels()
     _set_status(
         "UI ready. Run always starts a new job; use different job names for parallel runs. "
         "Jobs run in detached tmux sessions.",
