@@ -1113,9 +1113,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     # Binder remodel — form UI (loads/saves JSON under add_ons/configs)
     BINDERS_PER_PAGE = 5
-    binders_data: List[Dict[str, str]] = [
-        {"name": "binder_1", "sequence": "REPLACE_WITH_BINDER_SEQUENCE"}
-    ]
+    binders_data: List[Dict[str, str]] = [{"name": "", "sequence": ""}]
     binder_page = {"i": 0}
     _form_busy = {"v": False}
 
@@ -1125,15 +1123,11 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             opts.append((p.name, _rel_to_root(p)))
         return opts
 
-    example_rel = EXAMPLE_CONFIG_REL if (BOLTZ_ROOT / EXAMPLE_CONFIG_REL).is_file() else ""
     addon_opts = _addon_config_options()
-    if example_rel and example_rel not in {v for _, v in addon_opts}:
-        example_rel = ""
-    default_addon_value = example_rel if example_rel else ""
 
     addon_config_dd = widgets.Dropdown(
         options=addon_opts,
-        value=default_addon_value,
+        value="",
         description="Saved config:",
         style={"description_width": "120px"},
         layout=widgets.Layout(width="70%"),
@@ -1147,35 +1141,37 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     )
 
     remodel_job = widgets.Text(
-        value="example_binder_remodel",
+        value="",
         description="Job name:",
         placeholder="e.g. IFIT5_cropped_remodel",
         layout=widgets.Layout(width="70%"),
         style={"description_width": "120px"},
     )
     remodel_target_name = widgets.Text(
-        value="Target",
+        value="",
         description="Target name:",
         placeholder="e.g. IFIT5_cropped",
         layout=widgets.Layout(width="70%"),
         style={"description_width": "120px"},
     )
     remodel_target_id = widgets.Text(
-        value="A",
+        value="",
         description="Target id:",
+        placeholder="e.g. A",
         layout=widgets.Layout(width="30%"),
         style={"description_width": "120px"},
     )
     remodel_binder_id = widgets.Text(
-        value="B",
+        value="",
         description="Binder id:",
+        placeholder="e.g. B",
         layout=widgets.Layout(width="30%"),
         style={"description_width": "120px"},
     )
     remodel_target_seq = widgets.Textarea(
-        value="REPLACE_WITH_TARGET_SEQUENCE",
+        value="",
         description="Target seq:",
-        placeholder="Paste protein sequence here…",
+        placeholder="Paste target protein sequence (amino acids only)…",
         layout=widgets.Layout(width="95%", height="90px"),
         style={"description_width": "120px"},
     )
@@ -1429,8 +1425,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"up to {NAME_MAX_LEN} characters<br/>"
                 f"<b style='display:inline-block;margin-top:6px;'>Tips for sequences</b><br/>"
                 f"• Paste a protein sequence (standard amino acids only)<br/>"
-                f"• Letters are uppercased automatically, no spaces, up to {SEQ_MAX_LEN} residues<br/>"
-                f"• Replace any placeholder text before saving"
+                f"• Letters are uppercased automatically, no spaces, up to {SEQ_MAX_LEN} residues"
                 f"</div>"
             ),
             remodel_job,
@@ -1670,16 +1665,16 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             for idx in range(start, end):
                 entry = binders_data[idx]
                 nw = widgets.Text(
-                    value=entry.get("name") or f"binder_{idx + 1}",
+                    value=entry.get("name") or "",
                     description=f"Binder {idx + 1}:",
-                    placeholder="e.g. binder_1",
+                    placeholder=f"e.g. binder_{idx + 1}",
                     layout=widgets.Layout(width="95%"),
                     style={"description_width": "120px"},
                 )
                 sw = widgets.Textarea(
                     value=(entry.get("sequence") or "").upper(),
                     description="Sequence:",
-                    placeholder="Paste protein sequence here…",
+                    placeholder="Paste binder protein sequence (amino acids only)…",
                     layout=widgets.Layout(width="95%", height="70px"),
                     style={"description_width": "120px"},
                 )
@@ -1714,8 +1709,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         _flush_binder_page()
         n = max(1, int(n))
         while len(binders_data) < n:
-            i = len(binders_data) + 1
-            binders_data.append({"name": f"binder_{i}", "sequence": ""})
+            binders_data.append({"name": "", "sequence": ""})
         while len(binders_data) > n:
             binders_data.pop()
         remodel_n_binders.value = n
@@ -1769,7 +1763,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 elif isinstance(item, (list, tuple)) and len(item) >= 2:
                     parsed.append({"name": str(item[0]), "sequence": str(item[1]).upper()})
         if not parsed:
-            parsed = [{"name": "binder_1", "sequence": ""}]
+            parsed = [{"name": "", "sequence": ""}]
 
         binders_data.clear()
         binders_data.extend(parsed)
@@ -1806,12 +1800,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         opts = _addon_config_options()
         addon_config_dd.options = opts
         values = {v for _, v in opts}
-        if current in values:
-            addon_config_dd.value = current
-        elif EXAMPLE_CONFIG_REL in values:
-            addon_config_dd.value = EXAMPLE_CONFIG_REL
-        else:
-            addon_config_dd.value = ""
+        addon_config_dd.value = current if current in values else ""
         _set_status(
             f"Found {len(opts) - 1} config file(s) in {CONFIGS_DIR_REL}",
             True,
@@ -1852,6 +1841,24 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"{len(binders_data)} binder slot(s).</span>"
             )
 
+    def _reset_remodel_form() -> None:
+        """Clear remodel fields so placeholders show (used when no saved config is selected)."""
+        remodel_job.value = ""
+        remodel_target_name.value = ""
+        remodel_target_id.value = ""
+        remodel_binder_id.value = ""
+        remodel_target_seq.value = ""
+        addon_new_name.value = ""
+        binders_data.clear()
+        binders_data.append({"name": "", "sequence": ""})
+        remodel_n_binders.value = 1
+        binder_page["i"] = 0
+        _render_binder_page()
+        addon_summary.value = (
+            f'<span style="{MUTED}">Load a saved config or edit the form, '
+            "then Save config with a file name.</span>"
+        )
+
     def on_load_addon(_=None) -> bool:
         try:
             path_s = (addon_config_dd.value or "").strip()
@@ -1865,7 +1872,11 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             return False
 
     def on_addon_config_select(change) -> None:
-        if change.get("name") != "value" or not addon_config_dd.value:
+        if change.get("name") != "value":
+            return
+        if not (addon_config_dd.value or "").strip():
+            _reset_remodel_form()
+            _set_status("Cleared form — enter values or select a saved config.", True)
             return
         on_load_addon()
 
@@ -2271,11 +2282,6 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     _on_ent_type()
     _on_mode()
     _render_binder_page()
-    if default_addon_value:
-        try:
-            _load_addon_from_path(default_addon_value)
-        except Exception as exc:
-            _set_status(f"Could not load default config: {exc}", False)
 
     setup_tab = widgets.VBox(
         [
