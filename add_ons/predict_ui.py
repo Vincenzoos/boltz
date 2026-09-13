@@ -73,6 +73,28 @@ FIELD_VALIDATION_CSS = f"""
   outline: none !important;
   box-shadow: none !important;
 }}
+.boltz-binder-row {{
+  flex: 0 0 auto !important;
+  min-height: 160px !important;
+  overflow: visible !important;
+}}
+.boltz-binder-check {{
+  flex: 0 0 auto !important;
+  min-height: 28px !important;
+  overflow: visible !important;
+  display: flex !important;
+}}
+.boltz-binder-check .widget-checkbox {{
+  overflow: visible !important;
+  width: auto !important;
+}}
+.boltz-binders-box {{
+  overflow-x: hidden !important;
+}}
+.boltz-binders-box > .widget-vbox,
+.boltz-binders-box > .jupyter-widget-vbox {{
+  flex: 0 0 auto !important;
+}}
 </style>
 """
 
@@ -1224,6 +1246,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     BINDERS_PER_PAGE = 5
     binders_data: List[Dict[str, str]] = [{"name": "", "sequence": ""}]
     binder_page = {"i": 0}
+    binder_selected: set = set()  # indices into binders_data; persists across pages
     _form_busy = {"v": False}
 
     def _addon_config_options() -> List[Tuple[str, str]]:
@@ -1294,24 +1317,46 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         style={"description_width": "120px"},
     )
     btn_apply_n_binders = widgets.Button(
-        description="Update binder fields",
+        description="Update binder list",
         icon="list",
-        tooltip="Resize binder list to match # binders (keeps existing entries)",
+        tooltip="Update binder list to match # binders",
     )
+    n_binders_warn = widgets.HTML(value="")
     binder_page_label = widgets.HTML(value="")
     btn_binder_prev = widgets.Button(description="Prev", icon="arrow-left", disabled=True)
     btn_binder_next = widgets.Button(description="Next", icon="arrow-right", disabled=True)
+    btn_binder_select_page = widgets.Button(
+        description="Select page",
+        icon="check-square-o",
+        tooltip="Select all binders listed on the current page (keeps prior selections on other pages)",
+    )
+    btn_binder_clear_sel = widgets.Button(
+        description="Clear selection",
+        icon="trash",
+        button_style="danger",
+        tooltip="Uncheck all selected binders across every page",
+        disabled=True,
+    )
+    btn_add_binder = widgets.Button(
+        description="Add binder",
+        icon="plus",
+        button_style="info",
+        tooltip="Add a new empty binder on this page (no need to change # binders)",
+    )
     binders_box = widgets.VBox(
         [],
         layout=widgets.Layout(
             width="95%",
-            max_height="360px",
+            max_height="520px",
             overflow_y="auto",
+            overflow_x="hidden",
             border="1px solid #d0d7de",
             padding="8px",
             margin="4px 0",
+            flex="0 0 auto",
         ),
     )
+    binders_box.add_class("boltz-binders-box")
     addon_summary = widgets.HTML(
         value=(
             f'<span style="{MUTED}">Load a saved config or edit the form, '
@@ -1551,13 +1596,20 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             widgets.HTML(
                 f"<div style='font-size:12px;color:#57606a;margin:0 0 8px 0;line-height:1.5;'>"
                 "Same naming and sequence constraints as above for every binder.<br/>"
-                f"Set how many binders you need, then click <b>Update binder fields</b>. "
-                f"If the list is long, use Prev/Next (shows {BINDERS_PER_PAGE} at a time) or scroll."
+                f"Set how many binders you need, then click <b>Update binder lists</b>. "
+                f"If the list is long, use Prev/Next (shows {BINDERS_PER_PAGE} at a time) or scroll.<br/>"
+                "Check binders individually, or use <b>Select page</b> for everyone on this page "
+                "(selection is kept across pages). <b>Clear selection</b> unchecks all.<br/>"
+                f"When this page has fewer than {BINDERS_PER_PAGE} binders, use <b>Add binder</b> "
+                "to append one without changing # binders."
                 f"</div>"
             ),
             widgets.HBox([remodel_n_binders, btn_apply_n_binders]),
+            n_binders_warn,
             widgets.HBox([btn_binder_prev, binder_page_label, btn_binder_next]),
+            widgets.HBox([btn_binder_select_page, btn_binder_clear_sel]),
             binders_box,
+            btn_add_binder,
             widgets.HTML(f"<b>Save</b>"),
             widgets.HTML(
                 f"<div style='font-size:12px;color:#57606a;margin:0 0 4px 0;line-height:1.5;'>"
@@ -1737,6 +1789,24 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         except Exception as exc:
             _set_status(str(exc), False)
 
+    def _sync_n_binders_warn(_=None) -> None:
+        """Warn when # binders differs from the actual list until Update is clicked."""
+        try:
+            n = int(remodel_n_binders.value)
+        except Exception:
+            n = len(binders_data)
+        if n != len(binders_data):
+            n_binders_warn.value = (
+                f'<div style="color:#9a6700;background:#fff8c5;border:1px solid #d4a72c;'
+                f'border-radius:4px;padding:6px 10px;font-size:12px;margin:4px 0 8px 0;'
+                f'line-height:1.4;">'
+                f"# binders is set to <b>{n}</b>, but the list still has "
+                f"<b>{len(binders_data)}</b>. Click <b>Update binder list</b> "
+                f"to apply the change.</div>"
+            )
+        else:
+            n_binders_warn.value = ""
+
     def _flush_binder_page() -> None:
         """Write visible page widgets back into binders_data."""
         start = binder_page["i"] * BINDERS_PER_PAGE
@@ -1749,6 +1819,46 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     def _binder_page_count() -> int:
         n = max(1, len(binders_data))
         return max(1, (n + BINDERS_PER_PAGE - 1) // BINDERS_PER_PAGE)
+
+    def _prune_binder_selection() -> None:
+        binder_selected.intersection_update(range(len(binders_data)))
+
+    def _update_binder_selection_ui() -> None:
+        n = len(binder_selected)
+        btn_binder_clear_sel.disabled = n == 0
+        btn_binder_clear_sel.description = (
+            f"Clear selection ({n})" if n else "Clear selection"
+        )
+        n_pages = _binder_page_count()
+        sel_bit = f", {n} selected" if n else ""
+        binder_page_label.value = (
+            f"<span style='padding:0 10px;'>Page {binder_page['i'] + 1} / {n_pages} "
+            f"({len(binders_data)} binders, {BINDERS_PER_PAGE}/page{sel_bit})</span>"
+        )
+        btn_binder_prev.disabled = binder_page["i"] <= 0
+        btn_binder_next.disabled = binder_page["i"] >= n_pages - 1
+        # Show Add binder only when this page still has free slots
+        start = binder_page["i"] * BINDERS_PER_PAGE
+        end = min(start + BINDERS_PER_PAGE, len(binders_data))
+        on_page = max(0, end - start)
+        can_add = on_page < BINDERS_PER_PAGE and len(binders_data) < int(remodel_n_binders.max)
+        btn_add_binder.layout.display = None if can_add else "none"
+        btn_add_binder.disabled = not can_add
+        btn_add_binder.description = (
+            f"Add binder ({on_page}/{BINDERS_PER_PAGE})"
+            if can_add
+            else "Add binder"
+        )
+
+    def _on_binder_check(change) -> None:
+        if change.get("name") != "value" or _form_busy["v"]:
+            return
+        idx = change["owner"]._binder_idx  # type: ignore[attr-defined]
+        if change["new"]:
+            binder_selected.add(idx)
+        else:
+            binder_selected.discard(idx)
+        _update_binder_selection_ui()
 
     def _duplicate_binder_name_indices() -> set:
         """Indices of binders whose non-empty names collide (case-insensitive)."""
@@ -1859,6 +1969,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         nonlocal page_name_widgets, page_seq_widgets, page_seq_highlights
         _form_busy["v"] = True
         try:
+            _prune_binder_selection()
             n_pages = _binder_page_count()
             binder_page["i"] = max(0, min(binder_page["i"], n_pages - 1))
             start = binder_page["i"] * BINDERS_PER_PAGE
@@ -1869,20 +1980,37 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             rows = []
             for idx in range(start, end):
                 entry = binders_data[idx]
+                # Own-row checkbox (avoid HBox+Text flex collapse when many binders share the page)
+                cb = widgets.Checkbox(
+                    value=idx in binder_selected,
+                    description=f"#{idx + 1} of {len(binders_data)}",
+                    indent=False,
+                    layout=widgets.Layout(
+                        width="max-content",
+                        min_width="120px",
+                        height="28px",
+                        margin="0 0 6px 0",
+                        flex="0 0 auto",
+                        overflow="visible",
+                    ),
+                )
+                cb.add_class("boltz-binder-check")
+                cb._binder_idx = idx  # type: ignore[attr-defined]
+                cb.observe(_on_binder_check, names="value")
                 nw = widgets.Text(
                     value=entry.get("name") or "",
                     description=f"Binder {idx + 1}:",
                     placeholder=f"e.g. binder_{idx + 1}",
-                    layout=widgets.Layout(width="95%"),
-                    style={"description_width": "120px"},
+                    layout=widgets.Layout(width="95%", flex="0 0 auto"),
+                    style={"description_width": "100px"},
                 )
                 seq_val = _seq_letters_only(entry.get("sequence") or "")
                 sw = widgets.Textarea(
                     value=seq_val,
                     description="Sequence:",
                     placeholder="Paste binder protein sequence (letters A–Z only)…",
-                    layout=widgets.Layout(width="95%", height="70px"),
-                    style={"description_width": "120px"},
+                    layout=widgets.Layout(width="95%", height="70px", flex="0 0 auto"),
+                    style={"description_width": "100px"},
                 )
                 hw = widgets.HTML(value=_seq_highlight_html(seq_val))
                 nw.observe(_on_remodel_field_change, names="value")
@@ -1890,28 +2018,22 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 page_name_widgets.append(nw)
                 page_seq_widgets.append(sw)
                 page_seq_highlights.append(hw)
-                rows.append(
-                    widgets.VBox(
-                        [
-                            widgets.HTML(
-                                f"<span style='{MUTED}'>#{idx + 1} of {len(binders_data)}</span>"
-                            ),
-                            nw,
-                            sw,
-                            hw,
-                        ],
-                        layout=widgets.Layout(margin="0 0 10px 0"),
-                    )
+                row = widgets.VBox(
+                    [cb, nw, sw, hw],
+                    layout=widgets.Layout(
+                        width="100%",
+                        margin="0 0 14px 0",
+                        flex="0 0 auto",
+                        min_height="160px",
+                        overflow="visible",
+                    ),
                 )
+                row.add_class("boltz-binder-row")
+                rows.append(row)
             binders_box.children = tuple(rows) if rows else (
                 widgets.HTML(f'<span style="{MUTED}">No binders.</span>'),
             )
-            binder_page_label.value = (
-                f"<span style='padding:0 10px;'>Page {binder_page['i'] + 1} / {n_pages} "
-                f"({len(binders_data)} binders, {BINDERS_PER_PAGE}/page)</span>"
-            )
-            btn_binder_prev.disabled = binder_page["i"] <= 0
-            btn_binder_next.disabled = binder_page["i"] >= n_pages - 1
+            _update_binder_selection_ui()
         finally:
             _form_busy["v"] = False
         _refresh_remodel_borders()
@@ -1923,12 +2045,14 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             binders_data.append({"name": "", "sequence": ""})
         while len(binders_data) > n:
             binders_data.pop()
+        _prune_binder_selection()
         remodel_n_binders.value = n
         # Jump to last page if current page is out of range
         n_pages = _binder_page_count()
         if binder_page["i"] >= n_pages:
             binder_page["i"] = n_pages - 1
         _render_binder_page()
+        _sync_n_binders_warn()
 
     def _config_from_form() -> dict:
         _flush_binder_page()
@@ -1986,6 +2110,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
             binders_data.clear()
             binders_data.extend(parsed)
+            binder_selected.clear()
             remodel_n_binders.value = len(binders_data)
             binder_page["i"] = 0
         finally:
@@ -1998,6 +2123,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             addon_new_name.value = stem
         job_name.value = remodel_job.value
         _refresh_remodel_borders()
+        _sync_n_binders_warn()
 
     def on_apply_n_binders(_=None) -> None:
         try:
@@ -2017,6 +2143,41 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         if binder_page["i"] < _binder_page_count() - 1:
             binder_page["i"] += 1
             _render_binder_page()
+
+    def on_binder_select_page(_=None) -> None:
+        start = binder_page["i"] * BINDERS_PER_PAGE
+        end = min(start + BINDERS_PER_PAGE, len(binders_data))
+        binder_selected.update(range(start, end))
+        _render_binder_page()
+
+    def on_binder_clear_sel(_=None) -> None:
+        binder_selected.clear()
+        _render_binder_page()
+
+    def on_add_binder(_=None) -> None:
+        try:
+            _flush_binder_page()
+            max_n = int(remodel_n_binders.max)
+            if len(binders_data) >= max_n:
+                _set_status(f"Maximum of {max_n} binders reached.", False)
+                return
+            start = binder_page["i"] * BINDERS_PER_PAGE
+            end = min(start + BINDERS_PER_PAGE, len(binders_data))
+            if (end - start) >= BINDERS_PER_PAGE:
+                _set_status(
+                    f"This page is full ({BINDERS_PER_PAGE}/{BINDERS_PER_PAGE}). "
+                    "Go to the last page or raise # binders.",
+                    False,
+                )
+                return
+            binders_data.append({"name": "", "sequence": ""})
+            remodel_n_binders.value = len(binders_data)
+            binder_page["i"] = _binder_page_count() - 1
+            _render_binder_page()
+            _sync_n_binders_warn()
+            _set_status(f"Added binder #{len(binders_data)}.", True)
+        except Exception as exc:
+            _set_status(str(exc), False)
 
     def on_refresh_addon_list(_=None) -> None:
         current = addon_config_dd.value
@@ -2077,6 +2238,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             addon_new_name.value = ""
             binders_data.clear()
             binders_data.append({"name": "", "sequence": ""})
+            binder_selected.clear()
             remodel_n_binders.value = 1
             binder_page["i"] = 0
         finally:
@@ -2087,6 +2249,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             "then Save config with a file name.</span>"
         )
         _refresh_remodel_borders()
+        _sync_n_binders_warn()
 
     def on_load_addon(_=None) -> bool:
         try:
@@ -2492,8 +2655,12 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     addon_config_dd.observe(on_addon_config_select, names="value")
     btn_refresh_addon_list.on_click(on_refresh_addon_list)
     btn_apply_n_binders.on_click(on_apply_n_binders)
+    remodel_n_binders.observe(_sync_n_binders_warn, names="value")
     btn_binder_prev.on_click(on_binder_prev)
     btn_binder_next.on_click(on_binder_next)
+    btn_binder_select_page.on_click(on_binder_select_page)
+    btn_binder_clear_sel.on_click(on_binder_clear_sel)
+    btn_add_binder.on_click(on_add_binder)
     remodel_target_seq.observe(_sanitize_seq_widget, names="value")
     for _w in (
         remodel_job,
