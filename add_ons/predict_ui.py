@@ -20,6 +20,7 @@ Cursor's notebook widget renderer may fail with ipywidgetsKernel errors.
 from __future__ import annotations
 
 import csv
+import html
 import json
 import os
 import re
@@ -52,6 +53,9 @@ NAME_MAX_LEN = 100
 SEQ_MAX_LEN = 500
 # Letter start; only underscore/hyphen as specials; max 100 chars.
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,99}$")
+# Relative/absolute dir path: letters, digits, _ . - / ~ only (no spaces or shell junk).
+OUTPUTS_ROOT_RE = re.compile(r"^[A-Za-z0-9_./~-]+$")
+OUTPUTS_ROOT_MAX_LEN = 300
 
 BANNER = (
     "background:#dbeafe;padding:12px 16px;border-radius:6px;"
@@ -60,6 +64,17 @@ BANNER = (
 OK = "color:#1a7f37;font-weight:600;"
 ERR = "color:#cf222e;font-weight:600;"
 MUTED = "color:#57606a;"
+FIELD_INVALID_CLASS = "boltz-field-invalid"
+FIELD_VALIDATION_CSS = f"""
+<style>
+.{FIELD_INVALID_CLASS} input,
+.{FIELD_INVALID_CLASS} textarea {{
+  border: 2px solid #cf222e !important;
+  outline: none !important;
+  box-shadow: none !important;
+}}
+</style>
+"""
 
 RUNNING_JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -186,6 +201,98 @@ def _sanitize_name(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r"[^\w.\-]+", "_", name)
     return name.strip("._") or "item"
+
+
+def _seq_letters_only(raw: str) -> str:
+    """Keep only A–Z letters and uppercase (drops digits, spaces, symbols)."""
+    return "".join(c for c in (raw or "") if c.isalpha()).upper()
+
+
+def _name_constraint_ok(raw: str, *, require_nonempty: bool = False) -> bool:
+    """Return True if name meets UI constraints (or is empty when not required)."""
+    name = (raw or "").strip()
+    if not name:
+        return not require_nonempty
+    if any(ch.isspace() for ch in (raw or "")):
+        return False
+    if len(name) > NAME_MAX_LEN or name[:1].isdigit():
+        return False
+    return bool(NAME_RE.fullmatch(name))
+
+
+def _seq_constraint_ok(raw: str, *, require_nonempty: bool = False) -> bool:
+    """Return True if sequence meets UI constraints (or is empty when not required)."""
+    letters = _seq_letters_only(raw)
+    if not letters:
+        return not require_nonempty
+    if letters.startswith("REPLACEWITH") or "REPLACE" in letters:
+        return False
+    if any(c not in PROTEIN_AA for c in letters):
+        return False
+    if len(letters) > SEQ_MAX_LEN:
+        return False
+    return True
+
+
+def _outputs_root_constraint_ok(raw: str, *, require_nonempty: bool = False) -> bool:
+    """Return True if outputs root is a safe relative/absolute path (or empty when not required)."""
+    text = raw or ""
+    if not text.strip():
+        return not require_nonempty
+    # Spaces and shell/meta characters are not allowed (e.g. * & ; $).
+    if any(ch.isspace() for ch in text):
+        return False
+    path_s = text.strip()
+    if len(path_s) > OUTPUTS_ROOT_MAX_LEN:
+        return False
+    if not OUTPUTS_ROOT_RE.fullmatch(path_s):
+        return False
+    # Must not be only dots/slashes/tildes with no real name component.
+    if not re.search(r"[A-Za-z0-9_]", path_s):
+        return False
+    try:
+        Path(path_s).expanduser()
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _seq_highlight_html(raw: str) -> str:
+    """HTML preview with non-standard AA letters highlighted in red."""
+    letters = _seq_letters_only(raw)
+    if not letters:
+        return ""
+    bad = sorted({c for c in letters if c not in PROTEIN_AA})
+    if not bad:
+        return ""
+    parts: List[str] = []
+    for ch in letters:
+        esc = html.escape(ch)
+        if ch in PROTEIN_AA:
+            parts.append(esc)
+        else:
+            parts.append(
+                f'<span style="background:#fecaca;color:#b91c1c;font-weight:700;'
+                f'border-radius:2px;padding:0 1px;">{esc}</span>'
+            )
+    return (
+        f'<div style="margin:2px 0 8px 120px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+        f'font-size:12px;line-height:1.55;word-break:break-all;">'
+        f'<span style="{ERR}">Non-AA highlighted</span> '
+        f'<span style="{MUTED}">(invalid: {html.escape("".join(bad))})</span><br/>'
+        + "".join(parts)
+        + "</div>"
+    )
+
+
+def _set_field_border(widget: widgets.Widget, ok: bool) -> None:
+    """Mark invalid fields via CSS class so the border hits the input/textarea, not the label row."""
+    # Clear any legacy layout border from earlier versions.
+    widget.layout.border = None
+    if ok:
+        widget.remove_class(FIELD_INVALID_CLASS)
+    else:
+        widget.add_class(FIELD_INVALID_CLASS)
 
 
 def _rel_to_root(path: Path) -> str:
@@ -977,12 +1084,14 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     job_name = widgets.Text(
         value="boltz_job",
         description="Job name:",
+        placeholder="e.g. IFIT5_cropped_remodel",
         layout=widgets.Layout(width="70%"),
         style={"description_width": "120px"},
     )
     outputs_root_w = widgets.Text(
         value=str(default_outputs),
         description="Outputs root:",
+        placeholder="e.g. outputs",
         layout=widgets.Layout(width="70%"),
         style={"description_width": "120px"},
     )
@@ -1171,10 +1280,11 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     remodel_target_seq = widgets.Textarea(
         value="",
         description="Target seq:",
-        placeholder="Paste target protein sequence (amino acids only)…",
+        placeholder="Paste target protein sequence (letters A–Z only)…",
         layout=widgets.Layout(width="95%", height="90px"),
         style={"description_width": "120px"},
     )
+    remodel_target_seq_highlight = widgets.HTML(value="")
     remodel_n_binders = widgets.BoundedIntText(
         value=1,
         min=1,
@@ -1218,6 +1328,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     page_name_widgets: List[widgets.Text] = []
     page_seq_widgets: List[widgets.Textarea] = []
+    page_seq_highlights: List[widgets.HTML] = []
 
     # Options
     model = widgets.Dropdown(
@@ -1408,6 +1519,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     )
     remodel_panel = widgets.VBox(
         [
+            widgets.HTML(FIELD_VALIDATION_CSS),
             widgets.HTML(
                 f"<div style='background:#ede9fe;padding:10px 14px;border-radius:6px;margin:4px 0;'>"
                 f"<b>Edit or create a binder remodel config</b><br/>"
@@ -1424,14 +1536,17 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"• Start with a letter, no spaces, only <b><code>_</code></b> or <b><code>-</code></b> as separators, "
                 f"up to {NAME_MAX_LEN} characters<br/>"
                 f"<b style='display:inline-block;margin-top:6px;'>Tips for sequences</b><br/>"
-                f"• Paste a protein sequence (standard amino acids only)<br/>"
-                f"• Letters are uppercased automatically, no spaces, up to {SEQ_MAX_LEN} residues"
+                f"• Paste a protein sequence (standard amino acids: <code>{PROTEIN_AA}</code>)<br/>"
+                f"• Letters only — numbers, spaces, and symbols are removed automatically<br/>"
+                f"• Uppercased automatically; non-AA letters (e.g. B, J, O, U, X, Z) are highlighted; "
+                f"up to {SEQ_MAX_LEN} residues"
                 f"</div>"
             ),
             remodel_job,
             remodel_target_name,
             widgets.HBox([remodel_target_id, remodel_binder_id]),
             remodel_target_seq,
+            remodel_target_seq_highlight,
             widgets.HTML(f"<b>Binders</b>"),
             widgets.HTML(
                 f"<div style='font-size:12px;color:#57606a;margin:0 0 8px 0;line-height:1.5;'>"
@@ -1628,31 +1743,120 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         for j, (nw, sw) in enumerate(zip(page_name_widgets, page_seq_widgets)):
             idx = start + j
             if idx < len(binders_data):
-                binders_data[idx]["name"] = (nw.value or "").strip() or f"binder_{idx + 1}"
-                binders_data[idx]["sequence"] = (sw.value or "").upper()
+                binders_data[idx]["name"] = (nw.value or "").strip()
+                binders_data[idx]["sequence"] = _seq_letters_only(sw.value)
 
     def _binder_page_count() -> int:
         n = max(1, len(binders_data))
         return max(1, (n + BINDERS_PER_PAGE - 1) // BINDERS_PER_PAGE)
 
-    def _autocap_seq_widget(change) -> None:
-        """Force sequence textareas to uppercase as the user types."""
+    def _duplicate_binder_name_indices() -> set:
+        """Indices of binders whose non-empty names collide (case-insensitive)."""
+        seen: Dict[str, int] = {}
+        dups: set = set()
+        for i, b in enumerate(binders_data):
+            key = (b.get("name") or "").strip().lower()
+            if not key:
+                continue
+            if key in seen:
+                dups.add(i)
+                dups.add(seen[key])
+            else:
+                seen[key] = i
+        return dups
+
+    def _refresh_seq_highlights() -> None:
+        remodel_target_seq_highlight.value = _seq_highlight_html(remodel_target_seq.value)
+        for sw, hw in zip(page_seq_widgets, page_seq_highlights):
+            hw.value = _seq_highlight_html(sw.value)
+
+    def _refresh_setup_borders(_=None, *, require_nonempty: bool = False) -> None:
+        """Highlight Setup-tab inputs when they violate constraints."""
+        _set_field_border(
+            job_name, _name_constraint_ok(job_name.value, require_nonempty=require_nonempty)
+        )
+        _set_field_border(
+            outputs_root_w,
+            _outputs_root_constraint_ok(outputs_root_w.value, require_nonempty=require_nonempty),
+        )
+
+    def _on_setup_field_change(change) -> None:
+        if change.get("name") != "value":
+            return
+        _refresh_setup_borders()
+
+    def _refresh_remodel_borders(_=None, *, require_nonempty: bool = False) -> None:
+        """Highlight remodel inputs with a red border when they violate constraints."""
+        if _form_busy["v"]:
+            return
+        _set_field_border(
+            remodel_job, _name_constraint_ok(remodel_job.value, require_nonempty=require_nonempty)
+        )
+        _set_field_border(
+            remodel_target_name,
+            _name_constraint_ok(remodel_target_name.value, require_nonempty=require_nonempty),
+        )
+        _set_field_border(
+            remodel_target_id,
+            _name_constraint_ok(remodel_target_id.value, require_nonempty=require_nonempty),
+        )
+        _set_field_border(
+            remodel_binder_id,
+            _name_constraint_ok(remodel_binder_id.value, require_nonempty=require_nonempty),
+        )
+        _set_field_border(
+            remodel_target_seq,
+            _seq_constraint_ok(remodel_target_seq.value, require_nonempty=require_nonempty),
+        )
+        _set_field_border(
+            addon_new_name,
+            _name_constraint_ok(addon_new_name.value, require_nonempty=require_nonempty),
+        )
+
+        # Sync visible binder widgets into data for duplicate checks
+        start = binder_page["i"] * BINDERS_PER_PAGE
+        for j, (nw, sw) in enumerate(zip(page_name_widgets, page_seq_widgets)):
+            idx = start + j
+            if idx < len(binders_data):
+                binders_data[idx]["name"] = (nw.value or "").strip()
+                binders_data[idx]["sequence"] = _seq_letters_only(sw.value)
+        dups = _duplicate_binder_name_indices()
+        for j, (nw, sw) in enumerate(zip(page_name_widgets, page_seq_widgets)):
+            idx = start + j
+            name_ok = (
+                _name_constraint_ok(nw.value, require_nonempty=require_nonempty)
+                and idx not in dups
+            )
+            _set_field_border(nw, name_ok)
+            _set_field_border(
+                sw, _seq_constraint_ok(sw.value, require_nonempty=require_nonempty)
+            )
+        _refresh_seq_highlights()
+
+    def _on_remodel_field_change(change) -> None:
+        if change.get("name") != "value" or _form_busy["v"]:
+            return
+        _refresh_remodel_borders()
+
+    def _sanitize_seq_widget(change) -> None:
+        """Sequence fields: letters only, uppercased; strip digits/symbols/spaces."""
         if _form_busy["v"] or change.get("name") != "value":
             return
         w = change["owner"]
         raw = change.get("new")
         if raw is None:
             return
-        upper = str(raw).upper()
-        if upper != raw:
+        cleaned = _seq_letters_only(str(raw))
+        if cleaned != raw:
             _form_busy["v"] = True
             try:
-                w.value = upper
+                w.value = cleaned
             finally:
                 _form_busy["v"] = False
+        _refresh_remodel_borders()
 
     def _render_binder_page() -> None:
-        nonlocal page_name_widgets, page_seq_widgets
+        nonlocal page_name_widgets, page_seq_widgets, page_seq_highlights
         _form_busy["v"] = True
         try:
             n_pages = _binder_page_count()
@@ -1661,6 +1865,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             end = min(start + BINDERS_PER_PAGE, len(binders_data))
             page_name_widgets = []
             page_seq_widgets = []
+            page_seq_highlights = []
             rows = []
             for idx in range(start, end):
                 entry = binders_data[idx]
@@ -1671,16 +1876,20 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                     layout=widgets.Layout(width="95%"),
                     style={"description_width": "120px"},
                 )
+                seq_val = _seq_letters_only(entry.get("sequence") or "")
                 sw = widgets.Textarea(
-                    value=(entry.get("sequence") or "").upper(),
+                    value=seq_val,
                     description="Sequence:",
-                    placeholder="Paste binder protein sequence (amino acids only)…",
+                    placeholder="Paste binder protein sequence (letters A–Z only)…",
                     layout=widgets.Layout(width="95%", height="70px"),
                     style={"description_width": "120px"},
                 )
-                sw.observe(_autocap_seq_widget, names="value")
+                hw = widgets.HTML(value=_seq_highlight_html(seq_val))
+                nw.observe(_on_remodel_field_change, names="value")
+                sw.observe(_sanitize_seq_widget, names="value")
                 page_name_widgets.append(nw)
                 page_seq_widgets.append(sw)
+                page_seq_highlights.append(hw)
                 rows.append(
                     widgets.VBox(
                         [
@@ -1689,6 +1898,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                             ),
                             nw,
                             sw,
+                            hw,
                         ],
                         layout=widgets.Layout(margin="0 0 10px 0"),
                     )
@@ -1704,6 +1914,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             btn_binder_next.disabled = binder_page["i"] >= n_pages - 1
         finally:
             _form_busy["v"] = False
+        _refresh_remodel_borders()
 
     def _resize_binders(n: int) -> None:
         _flush_binder_page()
@@ -1731,7 +1942,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             "target": {
                 "id": (remodel_target_id.value or "A").strip() or "A",
                 "name": (remodel_target_name.value or "").strip() or "Target",
-                "sequence": remodel_target_seq.value or "",
+                "sequence": _seq_letters_only(remodel_target_seq.value),
             },
             "binder_id": (remodel_binder_id.value or "B").strip() or "B",
             "binders": binders,
@@ -1739,42 +1950,54 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     def _form_from_config(config: dict) -> None:
         """Populate form widgets from a binder_remodel config dict."""
-        target = config.get("target") if isinstance(config.get("target"), dict) else {}
-        remodel_job.value = str(config.get("job_name") or target.get("name") or "binder_remodel")
-        remodel_target_name.value = str(target.get("name") or "Target")
-        remodel_target_id.value = str(target.get("id") or "A")
-        remodel_binder_id.value = str(config.get("binder_id") or "B")
-        remodel_target_seq.value = str(target.get("sequence") or target.get("seq") or "").upper()
+        _form_busy["v"] = True
+        try:
+            target = config.get("target") if isinstance(config.get("target"), dict) else {}
+            remodel_job.value = str(config.get("job_name") or target.get("name") or "binder_remodel")
+            remodel_target_name.value = str(target.get("name") or "Target")
+            remodel_target_id.value = str(target.get("id") or "A")
+            remodel_binder_id.value = str(config.get("binder_id") or "B")
+            remodel_target_seq.value = _seq_letters_only(
+                str(target.get("sequence") or target.get("seq") or "")
+            )
 
-        raw = config.get("binders")
-        parsed: List[Dict[str, str]] = []
-        if isinstance(raw, dict):
-            for name, seq in raw.items():
-                parsed.append({"name": str(name), "sequence": str(seq or "").upper()})
-        elif isinstance(raw, list):
-            for i, item in enumerate(raw, start=1):
-                if isinstance(item, dict):
-                    parsed.append(
-                        {
-                            "name": str(item.get("name") or item.get("id") or f"binder_{i}"),
-                            "sequence": str(item.get("sequence") or item.get("seq") or "").upper(),
-                        }
-                    )
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    parsed.append({"name": str(item[0]), "sequence": str(item[1]).upper()})
-        if not parsed:
-            parsed = [{"name": "", "sequence": ""}]
+            raw = config.get("binders")
+            parsed: List[Dict[str, str]] = []
+            if isinstance(raw, dict):
+                for name, seq in raw.items():
+                    parsed.append({"name": str(name), "sequence": _seq_letters_only(str(seq or ""))})
+            elif isinstance(raw, list):
+                for i, item in enumerate(raw, start=1):
+                    if isinstance(item, dict):
+                        parsed.append(
+                            {
+                                "name": str(item.get("name") or item.get("id") or f"binder_{i}"),
+                                "sequence": _seq_letters_only(
+                                    str(item.get("sequence") or item.get("seq") or "")
+                                ),
+                            }
+                        )
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        parsed.append(
+                            {"name": str(item[0]), "sequence": _seq_letters_only(str(item[1]))}
+                        )
+            if not parsed:
+                parsed = [{"name": "", "sequence": ""}]
 
-        binders_data.clear()
-        binders_data.extend(parsed)
-        remodel_n_binders.value = len(binders_data)
-        binder_page["i"] = 0
+            binders_data.clear()
+            binders_data.extend(parsed)
+            remodel_n_binders.value = len(binders_data)
+            binder_page["i"] = 0
+        finally:
+            _form_busy["v"] = False
+
         _render_binder_page()
 
         stem = _sanitize_name(Path(str(config.get("job_name") or remodel_job.value)).stem)
         if not (addon_new_name.value or "").strip():
             addon_new_name.value = stem
         job_name.value = remodel_job.value
+        _refresh_remodel_borders()
 
     def on_apply_n_binders(_=None) -> None:
         try:
@@ -1843,21 +2066,27 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     def _reset_remodel_form() -> None:
         """Clear remodel fields so placeholders show (used when no saved config is selected)."""
-        remodel_job.value = ""
-        remodel_target_name.value = ""
-        remodel_target_id.value = ""
-        remodel_binder_id.value = ""
-        remodel_target_seq.value = ""
-        addon_new_name.value = ""
-        binders_data.clear()
-        binders_data.append({"name": "", "sequence": ""})
-        remodel_n_binders.value = 1
-        binder_page["i"] = 0
+        _form_busy["v"] = True
+        try:
+            remodel_job.value = ""
+            remodel_target_name.value = ""
+            remodel_target_id.value = ""
+            remodel_binder_id.value = ""
+            remodel_target_seq.value = ""
+            remodel_target_seq_highlight.value = ""
+            addon_new_name.value = ""
+            binders_data.clear()
+            binders_data.append({"name": "", "sequence": ""})
+            remodel_n_binders.value = 1
+            binder_page["i"] = 0
+        finally:
+            _form_busy["v"] = False
         _render_binder_page()
         addon_summary.value = (
             f'<span style="{MUTED}">Load a saved config or edit the form, '
             "then Save config with a file name.</span>"
         )
+        _refresh_remodel_borders()
 
     def on_load_addon(_=None) -> bool:
         try:
@@ -1904,17 +2133,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             return name
 
         def _check_seq(label: str, raw: str) -> str:
-            seq = (raw or "").upper()
-            if any(ch.isspace() for ch in (raw or "")):
-                errors.append(f"{label}: sequence cannot contain spaces.")
-            # Keep only letters for further checks; reject other junk explicitly
-            non_letter = sorted({c for c in seq if not c.isalpha() and not c.isspace()})
-            if non_letter:
-                errors.append(
-                    f"{label}: sequence may contain only protein letters "
-                    f"(found {''.join(non_letter)})."
-                )
-            letters = "".join(c for c in seq if c.isalpha())
+            letters = _seq_letters_only(raw)
             if not letters:
                 errors.append(f"{label}: protein sequence is empty.")
                 return ""
@@ -2017,6 +2236,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"— {len(docs)} YAML file(s).</span>"
             )
             _set_status(f"Saved remodel config: {rel}", True)
+            _refresh_remodel_borders()
         except Exception as exc:
             msg = str(exc)
             # Keep multiline validation errors readable in HTML
@@ -2024,6 +2244,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             html_msg = html_msg.replace("\n", "<br/>")
             addon_summary.value = f'<span style="{ERR}">{html_msg}</span>'
             _set_status("Validation failed — config not saved.", False)
+            _refresh_remodel_borders(require_nonempty=True)
 
     def current_cmd() -> Tuple[List[str], Dict[str, str], Path, Path]:
         inp = _resolve_input_for_run(write=input_mode.value != "path")
@@ -2141,6 +2362,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             job_label = out_dir.parent.name
         except Exception as exc:
             _set_status(str(exc), False)
+            _refresh_setup_borders(require_nonempty=True)
             return
 
         if _tmux_session_running(session):
@@ -2272,7 +2494,17 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     btn_apply_n_binders.on_click(on_apply_n_binders)
     btn_binder_prev.on_click(on_binder_prev)
     btn_binder_next.on_click(on_binder_next)
-    remodel_target_seq.observe(_autocap_seq_widget, names="value")
+    remodel_target_seq.observe(_sanitize_seq_widget, names="value")
+    for _w in (
+        remodel_job,
+        remodel_target_name,
+        remodel_target_id,
+        remodel_binder_id,
+        addon_new_name,
+    ):
+        _w.observe(_on_remodel_field_change, names="value")
+    job_name.observe(_on_setup_field_change, names="value")
+    outputs_root_w.observe(_on_setup_field_change, names="value")
     btn_save_addon.on_click(on_save_addon)
     btn_run.on_click(on_run)
     btn_refresh_jobs.on_click(_refresh_abort_jobs)
@@ -2282,12 +2514,23 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     _on_ent_type()
     _on_mode()
     _render_binder_page()
+    _refresh_setup_borders()
 
     setup_tab = widgets.VBox(
         [
+            widgets.HTML(FIELD_VALIDATION_CSS),
             _banner("Boltz Predict UI"),
             widgets.HTML(
                 "<p style='margin:0 0 8px 0;'>Configure outputs directory for boltz prediction job.</p>"
+            ),
+            widgets.HTML(
+                f"<div style='font-size:12px;color:#57606a;margin:0 0 8px 0;line-height:1.5;'>"
+                f"<b>Job name</b> — same rules as remodel names: start with a letter, no spaces, "
+                f"only <code>_</code> or <code>-</code>, up to {NAME_MAX_LEN} characters.<br/>"
+                f"<b>Outputs root</b> — relative or absolute directory path using only letters, "
+                f"digits, <code>_</code> <code>-</code> <code>.</code> <code>/</code> <code>~</code> "
+                f"(no spaces or symbols like <code>*&amp;;$</code>)."
+                f"</div>"
             ),
             job_name,
             outputs_root_w,
