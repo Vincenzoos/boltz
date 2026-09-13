@@ -1,0 +1,15 @@
+{
+  "job_name": "example_binder_remodel",
+  "target": {
+    "id": "A",
+    "name": "Target",
+    "sequence": "REPLACE_WITH_TARGET_SEQUENCE"
+  },
+  "binder_id": "B",
+  "binders": [
+    {
+      "name": "binder_1",
+      "sequence": "REPLACE_WITH_BINDER_SEQUENCE"
+    }
+  ]
+}
