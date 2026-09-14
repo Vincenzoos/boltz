@@ -169,3 +169,7 @@ boltz_results_*/
 # Boltz prediction outputs from notebook UI
 outputs/
 outputs.zip
+
+# conda environments
+.conda-envs/
+.conda-pkgs/

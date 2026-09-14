@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Boltz into a conda env named "boltz" and prepare
+# Install Boltz into a conda env under this project directory and prepare
 # notebooks/Boltz_Remodel_UI.ipynb for use.
 #
 # Usage:
@@ -7,10 +7,16 @@
 #   ./install_boltz.sh --cpu        # CPU-only (no cuequivariance)
 #   ./install_boltz.sh --force      # recreate env if it already exists
 #   ./install_boltz.sh --python 3.11
+#
+# The environment and Conda package cache default to storage rather than
+# the user's home filesystem. Override them with BOLTZ_ENV_PREFIX or
+# BOLTZ_CONDA_PKGS_DIR if needed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_NAME="boltz"
+ENV_PREFIX="${BOLTZ_ENV_PREFIX:-${SCRIPT_DIR}/.conda-envs/${ENV_NAME}}"
+CONDA_PKGS_DIR="${BOLTZ_CONDA_PKGS_DIR:-${SCRIPT_DIR}/.conda-pkgs}"
 PYTHON_VERSION="3.11"
 USE_CUDA=1
 FORCE=0
@@ -56,32 +62,39 @@ esac
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "Error: conda not found on PATH. Install Miniconda/Anaconda first." >&2
+  echo "This script will not install Conda itself." >&2
   exit 1
 fi
 
-# Make conda available in non-interactive shells
+# Make conda available in non-interactive shells.
 # shellcheck disable=SC1091
-source "$(conda info --base)/etc/profile.d/conda.sh"
+CONDA_BASE="$(conda info --base)"
+if [[ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
+  echo "Error: conda shell integration not found under '${CONDA_BASE}'." >&2
+  exit 1
+fi
+# shellcheck disable=SC1091
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-if conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
+mkdir -p "$(dirname "${ENV_PREFIX}")" "${CONDA_PKGS_DIR}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIR}"
+
+if [[ -d "${ENV_PREFIX}" ]]; then
   if [[ "${FORCE}" -eq 1 ]]; then
-    echo "==> Removing existing conda env '${ENV_NAME}'"
-    conda env remove -n "${ENV_NAME}" -y
+    echo "==> Removing existing conda env '${ENV_PREFIX}'"
+    conda env remove -p "${ENV_PREFIX}" -y
   else
-    echo "==> Conda env '${ENV_NAME}' already exists (use --force to recreate)"
+    echo "==> Conda env '${ENV_PREFIX}' already exists (use --force to recreate)"
   fi
 fi
 
-if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-  echo "==> Creating conda env '${ENV_NAME}' (Python ${PYTHON_VERSION})"
-  conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+if [[ ! -d "${ENV_PREFIX}" ]]; then
+  echo "==> Creating conda env '${ENV_PREFIX}' (Python ${PYTHON_VERSION})"
+  conda create -p "${ENV_PREFIX}" "python=${PYTHON_VERSION}" pip -y
 fi
 
-echo "==> Activating '${ENV_NAME}'"
-conda activate "${ENV_NAME}"
-
-echo "==> Upgrading pip / setuptools / wheel"
-python -m pip install -U pip setuptools wheel
+echo "==> Activating '${ENV_PREFIX}'"
+conda activate "${ENV_PREFIX}"
 
 EXTRAS=""
 if [[ "${USE_CUDA}" -eq 1 ]]; then
@@ -92,24 +105,21 @@ else
 fi
 
 cd "${SCRIPT_DIR}"
-python -m pip install -e ".${EXTRAS}"
+echo "==> Installing Boltz dependencies without a pip cache"
+python -m pip install --no-cache-dir -e ".${EXTRAS}"
 
-echo "==> Installing notebook / UI dependencies"
-python -m pip install \
+echo "==> Installing minimal notebook / UI dependencies without a pip cache"
+python -m pip install --no-cache-dir \
   'ipywidgets>=8' \
-  jupyterlab_widgets \
-  widgetsnbextension \
-  pyyaml \
   ipykernel \
-  jupyterlab \
-  notebook
+  jupyterlab
 
 echo "==> Registering Jupyter kernel '${ENV_NAME}'"
 python -m ipykernel install --user --name "${ENV_NAME}" --display-name "Python (boltz)"
 
 echo
 echo "Done."
-echo "  conda activate ${ENV_NAME}"
+echo "  conda activate ${ENV_PREFIX}"
 echo "  jupyter lab notebooks/Boltz_Remodel_UI.ipynb"
 echo "  # or open the notebook in Cursor/VS Code and select kernel: Python (boltz)"
 if [[ "${USE_CUDA}" -eq 1 ]]; then
