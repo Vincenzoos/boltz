@@ -1332,9 +1332,15 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     )
     btn_binder_clear_sel = widgets.Button(
         description="Clear selection",
+        icon="eraser",
+        tooltip="Uncheck all selected binders across every page",
+        disabled=True,
+    )
+    btn_binder_delete = widgets.Button(
+        description="Delete selected",
         icon="trash",
         button_style="danger",
-        tooltip="Uncheck all selected binders across every page",
+        tooltip="Remove all checked binders from the list (across every page)",
         disabled=True,
     )
     btn_add_binder = widgets.Button(
@@ -1599,7 +1605,8 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"Set how many binders you need, then click <b>Update binder lists</b>. "
                 f"If the list is long, use Prev/Next (shows {BINDERS_PER_PAGE} at a time) or scroll.<br/>"
                 "Check binders individually, or use <b>Select page</b> for everyone on this page "
-                "(selection is kept across pages). <b>Clear selection</b> unchecks all.<br/>"
+                "(selection is kept across pages). <b>Clear selection</b> unchecks all. "
+                "<b>Delete selected</b> removes checked binders from the list.<br/>"
                 f"When this page has fewer than {BINDERS_PER_PAGE} binders, use <b>Add binder</b> "
                 "to append one without changing # binders."
                 f"</div>"
@@ -1607,7 +1614,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             widgets.HBox([remodel_n_binders, btn_apply_n_binders]),
             n_binders_warn,
             widgets.HBox([btn_binder_prev, binder_page_label, btn_binder_next]),
-            widgets.HBox([btn_binder_select_page, btn_binder_clear_sel]),
+            widgets.HBox([btn_binder_select_page, btn_binder_clear_sel, btn_binder_delete]),
             binders_box,
             btn_add_binder,
             widgets.HTML(f"<b>Save</b>"),
@@ -1828,6 +1835,10 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         btn_binder_clear_sel.disabled = n == 0
         btn_binder_clear_sel.description = (
             f"Clear selection ({n})" if n else "Clear selection"
+        )
+        btn_binder_delete.disabled = n == 0
+        btn_binder_delete.description = (
+            f"Delete selected ({n})" if n else "Delete selected"
         )
         n_pages = _binder_page_count()
         sel_bit = f", {n} selected" if n else ""
@@ -2153,6 +2164,32 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     def on_binder_clear_sel(_=None) -> None:
         binder_selected.clear()
         _render_binder_page()
+
+    def on_binder_delete(_=None) -> None:
+        try:
+            _flush_binder_page()
+            if not binder_selected:
+                _set_status("Select one or more binders to delete.", False)
+                return
+            keep = [b for i, b in enumerate(binders_data) if i not in binder_selected]
+            n_deleted = len(binders_data) - len(keep)
+            if not keep:
+                keep = [{"name": "", "sequence": ""}]
+            binders_data.clear()
+            binders_data.extend(keep)
+            binder_selected.clear()
+            remodel_n_binders.value = len(binders_data)
+            n_pages = _binder_page_count()
+            if binder_page["i"] >= n_pages:
+                binder_page["i"] = n_pages - 1
+            _render_binder_page()
+            _sync_n_binders_warn()
+            _set_status(
+                f"Deleted {n_deleted} binder(s). {len(binders_data)} remaining.",
+                True,
+            )
+        except Exception as exc:
+            _set_status(str(exc), False)
 
     def on_add_binder(_=None) -> None:
         try:
@@ -2508,8 +2545,9 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         _update_selected_job_progress()
 
     def _log_job(session: str, msg: str, *, end: str = "\n") -> None:
-        with log:
-            print(f"[{session}] {msg}", end=end, flush=True)
+        # Output's `with log: print()` only captures the kernel thread, so job
+        # logs started in a daemon thread never appeared. append_stdout does.
+        log.append_stdout(f"[{session}] {msg}{end}")
 
     def on_run(_=None) -> None:
         if shutil.which("tmux") is None:
@@ -2537,6 +2575,20 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             _refresh_abort_jobs()
             return
 
+        cmd_line = subprocess.list2cmdline(cmd)
+        header = (
+            f"[start] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"tmux session = {session}\n"
+            f"input = {inp}\n"
+            f"out   = {out_dir}\n"
+            f"log   = {log_path}\n"
+            f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<default>')}\n"
+            f"command = {cmd_line}\n"
+            f"attach: tmux attach -t {session}\n"
+            + "=" * 60 + "\n"
+        )
+        # Show the command immediately on the kernel thread (before the worker starts).
+        _log_job(session, header, end="")
         _set_status(
             f"Started {session} (job: {job_label}). "
             f"Change job name and Run again for parallel jobs. Attach: tmux attach -t {session}",
@@ -2544,20 +2596,9 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         )
 
         def worker() -> None:
-            header = (
-                f"[start] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"tmux session = {session}\n"
-                f"input = {inp}\n"
-                f"out   = {out_dir}\n"
-                f"log   = {log_path}\n"
-                f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<default>')}\n"
-                f"{subprocess.list2cmdline(cmd)}\n"
-                f"attach: tmux attach -t {session}\n"
-                + "=" * 60 + "\n"
-            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(header)
             shell_script = _build_tmux_shell(cmd, env, log_path)
-            _log_job(session, header, end="")
             try:
                 _tmux_start(session, shell_script)
             except FileNotFoundError:
@@ -2660,6 +2701,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     btn_binder_next.on_click(on_binder_next)
     btn_binder_select_page.on_click(on_binder_select_page)
     btn_binder_clear_sel.on_click(on_binder_clear_sel)
+    btn_binder_delete.on_click(on_binder_delete)
     btn_add_binder.on_click(on_add_binder)
     remodel_target_seq.observe(_sanitize_seq_widget, names="value")
     for _w in (
