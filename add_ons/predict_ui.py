@@ -1575,7 +1575,8 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
                 f"<div style='background:#ede9fe;padding:10px 14px;border-radius:6px;margin:4px 0;'>"
                 f"<b>Edit or create a binder remodel config</b><br/>"
                 f"<span style='{MUTED}'>Pair one target with many binders — each binder becomes its own Boltz job. <br/>"
-                f"<span style='{MUTED}'>Protein sequences supported only (no DNA, RNA, or ligands).</span></div>"
+                f"<span style='{MUTED}'>Protein sequences supported only (no DNA, RNA, or ligands).<br/>"
+                f"Prediction outputs are always written to <code>outputs/&lt;job name&gt;/</code>.</span></div>"
             ),
             widgets.HBox([addon_config_dd, btn_refresh_addon_list]),
             widgets.HTML(f"<b>Target</b>"),
@@ -1648,10 +1649,21 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         else:
             status.value = f'<span style="{MUTED}">{msg}</span>'
 
+    def _fixed_outputs_root() -> Path:
+        """Prediction outputs always land under the project outputs/ directory."""
+        return DEFAULT_OUTPUTS.resolve()
+
+    def _current_job_name() -> str:
+        """Job folder name comes from the Input tab (remodel job), not Setup."""
+        if input_mode.value == "remodel":
+            job = _sanitize_name(remodel_job.value)
+            if job:
+                return job
+        return _sanitize_name(job_name.value) or "boltz_job"
+
     def _paths() -> Tuple[Path, Path]:
-        raw = Path(outputs_root_w.value.strip() or str(default_outputs)).expanduser()
-        root = raw.resolve() if raw.is_absolute() else (BOLTZ_ROOT / raw).resolve()
-        job = _sanitize_name(job_name.value) or "boltz_job"
+        root = _fixed_outputs_root()
+        job = _current_job_name()
         return root / job / "yaml", root / job / "out"
 
     def _refresh_entities_view() -> None:
@@ -1957,6 +1969,8 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     def _on_remodel_field_change(change) -> None:
         if change.get("name") != "value" or _form_busy["v"]:
             return
+        if change.get("owner") is remodel_job:
+            job_name.value = remodel_job.value
         _refresh_remodel_borders()
 
     def _sanitize_seq_widget(change) -> None:
@@ -2481,8 +2495,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         return str(_paths()[1])
 
     def _outputs_root_resolved() -> Path:
-        raw = Path(outputs_root_w.value.strip() or str(default_outputs)).expanduser()
-        return raw.resolve() if raw.is_absolute() else (BOLTZ_ROOT / raw).resolve()
+        return _fixed_outputs_root()
 
     def _log_path_for_session(session: str) -> Optional[Path]:
         if not session:
@@ -2725,28 +2738,30 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     _render_binder_page()
     _refresh_setup_borders()
 
-    setup_tab = widgets.VBox(
-        [
-            widgets.HTML(FIELD_VALIDATION_CSS),
-            _banner("Boltz Predict UI"),
-            widgets.HTML(
-                "<p style='margin:0 0 8px 0;'>Configure outputs directory for boltz prediction job.</p>"
-            ),
-            widgets.HTML(
-                f"<div style='font-size:12px;color:#57606a;margin:0 0 8px 0;line-height:1.5;'>"
-                f"<b>Job name</b> — same rules as remodel names: start with a letter, no spaces, "
-                f"only <code>_</code> or <code>-</code>, up to {NAME_MAX_LEN} characters.<br/>"
-                f"<b>Outputs root</b> — relative or absolute directory path using only letters, "
-                f"digits, <code>_</code> <code>-</code> <code>.</code> <code>/</code> <code>~</code> "
-                f"(no spaces or symbols like <code>*&amp;;$</code>)."
-                f"</div>"
-            ),
-            job_name,
-            outputs_root_w,
-            # boltz_bin,
-            # cache_dir,
-        ]
-    )
+    # Setup tab commented out: job name comes from the Input tab, and prediction
+    # outputs are always written under outputs/ (see _fixed_outputs_root).
+    # setup_tab = widgets.VBox(
+    #     [
+    #         widgets.HTML(FIELD_VALIDATION_CSS),
+    #         _banner("Boltz Predict UI"),
+    #         widgets.HTML(
+    #             "<p style='margin:0 0 8px 0;'>Configure outputs directory for boltz prediction job.</p>"
+    #         ),
+    #         widgets.HTML(
+    #             f"<div style='font-size:12px;color:#57606a;margin:0 0 8px 0;line-height:1.5;'>"
+    #             f"<b>Job name</b> — same rules as remodel names: start with a letter, no spaces, "
+    #             f"only <code>_</code> or <code>-</code>, up to {NAME_MAX_LEN} characters.<br/>"
+    #             f"<b>Outputs root</b> — relative or absolute directory path using only letters, "
+    #             f"digits, <code>_</code> <code>-</code> <code>.</code> <code>/</code> <code>~</code> "
+    #             f"(no spaces or symbols like <code>*&amp;;$</code>)."
+    #             f"</div>"
+    #         ),
+    #         job_name,
+    #         outputs_root_w,
+    #         # boltz_bin,
+    #         # cache_dir,
+    #     ]
+    # )
     input_tab = widgets.VBox([_banner("Input"), input_mode, input_body])
     opts_tab = widgets.VBox(
         [
@@ -2796,8 +2811,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     # ---- Download / zip ----
     def _outputs_dir() -> Path:
-        raw = Path(outputs_root_w.value.strip() or str(default_outputs)).expanduser()
-        return raw.resolve() if raw.is_absolute() else (BOLTZ_ROOT / raw).resolve()
+        return _fixed_outputs_root()
 
     def _refresh_results_folders(_=None, *, prefer: Optional[str] = None) -> None:
         prev = prefer if prefer is not None else results_folder_dd.value
@@ -2806,8 +2820,8 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
         values = [v for _, v in opts]
         if prev in values and prev:
             results_folder_dd.value = prev
-        elif job_name.value in values:
-            results_folder_dd.value = job_name.value
+        elif _current_job_name() in values:
+            results_folder_dd.value = _current_job_name()
         else:
             results_folder_dd.value = values[0] if values else ""
 
@@ -2834,7 +2848,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
     btn_refresh_result_folders.on_click(_refresh_results_folders)
     btn_refresh_results.on_click(_load_results_for_selected)
     results_folder_dd.observe(on_results_folder_change, names="value")
-    _refresh_results_folders(prefer=_sanitize_name(job_name.value) or "")
+    _refresh_results_folders(prefer=_current_job_name())
     _load_results_for_selected()
 
     results_tab = widgets.VBox(
@@ -2933,7 +2947,7 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
 
     tabs = widgets.Tab(
         children=[
-            setup_tab,
+            # setup_tab,
             input_tab,
             opts_tab,
             run_tab,
@@ -2942,16 +2956,16 @@ def launch_ui(*, outputs_root: Optional[Path] = None) -> None:
             download_tab,
         ]
     )
-    tabs.set_title(0, "Setup")
-    tabs.set_title(1, "Input")
-    tabs.set_title(2, "Options")
-    tabs.set_title(3, "Run")
-    tabs.set_title(4, "Monitor")
-    tabs.set_title(5, "Results")
-    tabs.set_title(6, "Download")
+    # tabs.set_title(0, "Setup")
+    tabs.set_title(0, "Input")
+    tabs.set_title(1, "Options")
+    tabs.set_title(2, "Run")
+    tabs.set_title(3, "Monitor")
+    tabs.set_title(4, "Results")
+    tabs.set_title(5, "Download")
 
-    MONITOR_TAB_INDEX = 4
-    RESULTS_TAB_INDEX = 5
+    MONITOR_TAB_INDEX = 3
+    RESULTS_TAB_INDEX = 4
 
     def on_tab_change(change) -> None:
         if change.get("name") != "selected_index":
